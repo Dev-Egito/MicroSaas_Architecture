@@ -1,0 +1,6 @@
+[submodule "todo-service"]
+	path = todo-service
+	url = https://github.com/Dev-Egito/To-do_Service.git
+[submodule "booking-service"]
+	path = booking-service
+	url = https://github.com/Dev-Egito/Booking_Service.git
