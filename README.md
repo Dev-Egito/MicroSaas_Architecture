@@ -17,7 +17,7 @@ graph TD
 
     %% Write Model (Node.js)
     subgraph WriteModel ["Write Model (Booking & Mutação)"]
-        NodeAPI[Booking Service - Node.js / Express]
+        NodeAPI[Booking Service - Node.js / Express - Porta 8081]
         PostgreSQL[(PostgreSQL - Porta 5433)]
         Cockatiel[Cockatiel - Circuit Breaker & Retry]
         SocketServer[Socket.io Server]
@@ -25,8 +25,8 @@ graph TD
 
     %% Read Model (Laravel)
     subgraph ReadModel ["Read Model (Kanban & Leitura)"]
-        LaravelApp[To-Do Service - Laravel 12]
-        MySQL[(MySQL - Porta 3306/3307)]
+        LaravelApp[To-Do Service - Laravel 12 - Porta 8000]
+        MySQL[(MySQL - Porta 3307)]
         Ganesha[Ackintosh Ganesha - CB]
     end
 
@@ -65,12 +65,19 @@ graph TD
 
 ### 1. CQRS (Command Query Responsibility Segregation)
 
-- **Write Model** (`Booking_Service` - Node.js + TypeScript + PostgreSQL): Responsável pelo processamento de comandos que alteram o estado da aplicação (Criação, Atualização e Agendamento de Reuniões).
-- **Read Model** (`To-do_Service` - Laravel 12 + MySQL + Redis): Otimizado estritamente para consultas ultrarrápidas, mantendo tabelas desnormalizadas sincronizadas assincronamente via eventos.
+- **Write Model** (`booking-service` — Node.js + TypeScript + PostgreSQL, porta **8081**): único ponto de mutação. Cria, atualiza, move e remove cards do Kanban e agenda reuniões.
+- **Read Model** (`todo-service` — Laravel 12 + MySQL + Redis, porta **8000**): **Kanban READ-ONLY**. Expõe apenas `GET` de boards e cards. Não aceita `POST`/`PUT`/`DELETE` de negócio; o estado é projetado a partir dos eventos do RabbitMQ.
 
 ### 2. Comunicação Assíncrona & Mensageria (RabbitMQ)
 
-A criação ou alteração de uma reunião no serviço Node.js dispara um evento de integração no RabbitMQ (`reuniao_criada`, `cards_queue`), que é consumido pelos workers assíncronos do Laravel com garantia de idempotência via verificação de UUID.
+O Booking Service publica eventos nas filas:
+
+| Fila | Origem | Consumidor Laravel |
+|---|---|---|
+| `reuniao_criada` | Criação de reunião | `php artisan rabbitmq:consume-reuniao-criada` |
+| `kanban_events` | `CardCriadoEvent`, `CardAtualizadoEvent`, `CardMovidoEvent`, `CardDeletadoEvent` | `php artisan rabbitmq:consume-kanban-events` |
+
+A idempotência usa o `id` da reunião em `reunioes_read` e o `source_id` (ID do card no Write Model) na tabela `cards`.
 
 ### 3. Resiliência e Tolerância a Falhas
 
@@ -96,10 +103,10 @@ Este repositório atua como o Orquestrador Central da Arquitetura, reunindo os s
 
 ```plaintext
 MicroSaas_Architecture/
-├── todo-service/          # 📝 [Laravel 12] Serviço de Kanban e Read Model (Forked)
-├── booking-service/       # 📅 [Node.js + Flutter] Serviço de Agendamento e Write Model (Forked)
-├── docker-compose.yml     # 🐳 Orquestração unificada de toda a infraestrutura local
-└── README.md              # 📖 Documentação técnica da arquitetura
+├── todo-service/                     # 📝 [Laravel 12] Kanban Read Model (GET only)
+├── booking-service/                  # 📅 [Node.js + Flutter] Write Model + orquestração
+│   └── docker-compose.yml            # 🐳 Stack unificada (Node, Laravel, bancos, RabbitMQ)
+└── README.md
 ```
 
 ---
@@ -126,17 +133,22 @@ Caso já tenha clonado sem o `--recursive`, rode:
 git submodule update --init --recursive
 ```
 
-### Passo 2: Criar a Rede Compartilhada do Docker
+### Passo 2: Inicializar a Infraestrutura
+
+A orquestração unificada está em `booking-service/docker-compose.yml` (a rede `microsaas-net` é criada pelo Compose).
 
 ```bash
-docker network create microsaas-net
-```
-
-### Passo 3: Inicializar a Infraestrutura
-
-```bash
+cd booking-service
 docker compose up -d --build
 ```
+
+Depois, rode as migrations do Read Model:
+
+```bash
+docker compose exec laravel-app php artisan migrate --force
+```
+
+Os workers `cqrs_laravel_worker_reuniao` e `cqrs_laravel_worker_kanban` sobem junto da stack e consomem `reuniao_criada` e `kanban_events`.
 
 ---
 
@@ -144,15 +156,18 @@ docker compose up -d --build
 
 | Serviço / Dashboard        | Tecnologia         | Porta Host  | URL / Descrição                              |
 |-----------------------------|---------------------|-------------|-----------------------------------------------|
-| API Kanban (Read Model)     | Laravel 12 / Nginx  | 8081        | http://localhost:8081                          |
-| API Booking (Write Model)   | Node.js / Express   | 8080 / 8082 | http://localhost:8080                          |
-| Swagger UI (Kanban)         | L5-Swagger          | 8081        | http://localhost:8081/api/documentation        |
+| API Booking (Write Model)   | Node.js / Express   | 8081        | http://localhost:8081 — POST/PUT/DELETE        |
+| API Kanban (Read Model)     | Laravel 12 / Nginx  | 8000        | http://localhost:8000 — apenas GET             |
+| Swagger UI (Kanban)         | L5-Swagger          | 8000        | http://localhost:8000/api/documentation        |
+| Swagger UI (Booking)        | Swagger UI          | 8081        | http://localhost:8081/api/docs                 |
 | RabbitMQ Management         | RabbitMQ 3          | 15672       | http://localhost:15672 (guest/guest)           |
 | Prometheus Metrics          | Prometheus          | 9090        | http://localhost:9090                          |
 | Grafana Dashboards          | Grafana             | 3000        | http://localhost:3000 (admin/admin)            |
-| Banco MySQL (Read)          | MySQL 8.0           | 3306        | Banco de dados de Leitura                      |
+| Banco MySQL (Read)          | MySQL 8.0           | 3307        | Banco de dados de Leitura                      |
 | Banco Postgres (Write)      | PostgreSQL 15       | 5433        | Banco de dados de Escrita                      |
-| Cache & Sub/Pub              | Redis 7             | 6379        | Cache global e estado de Circuit Breakers      |
+| Cache & Sub/Pub             | Redis 7             | 6379        | Cache global e estado de Circuit Breakers      |
+
+> **CQRS no cliente:** o Flutter envia mutações para `localhost:8081` e consultas Kanban para `localhost:8000`. Isolated `todo-service/php-service/docker-compose.yaml` ainda mapeia o Nginx do Laravel em `8081` — use apenas um dos Compose por vez para evitar conflito de portas.
 
 ---
 
